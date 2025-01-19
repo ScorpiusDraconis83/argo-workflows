@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -137,7 +138,7 @@ func validateHooks(hooks wfv1.LifecycleHooks, hookBaseName string) error {
 }
 
 // ValidateWorkflow accepts a workflow and performs validation against it.
-func ValidateWorkflow(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, wf *wfv1.Workflow, opts ValidateOpts) error {
+func ValidateWorkflow(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, wf *wfv1.Workflow, wfDefaults *wfv1.Workflow, opts ValidateOpts) error {
 	ctx := newTemplateValidationCtx(wf, opts)
 	tmplCtx := templateresolution.NewContext(wftmplGetter, cwftmplGetter, wf, wf)
 	var wfSpecHolder wfv1.WorkflowSpecHolder
@@ -210,6 +211,10 @@ func ValidateWorkflow(wftmplGetter templateresolution.WorkflowTemplateNamespaced
 	if wf.Spec.WorkflowMetadata != nil {
 		annotationSources = append(annotationSources, maps.Keys(wf.Spec.WorkflowMetadata.Annotations))
 		labelSources = append(labelSources, maps.Keys(wf.Spec.WorkflowMetadata.Labels), maps.Keys(wf.Spec.WorkflowMetadata.LabelsFrom))
+	}
+	if wfDefaults != nil && wfDefaults.Spec.WorkflowMetadata != nil {
+		annotationSources = append(annotationSources, maps.Keys(wfDefaults.Spec.WorkflowMetadata.Annotations))
+		labelSources = append(labelSources, maps.Keys(wfDefaults.Spec.WorkflowMetadata.Labels), maps.Keys(wfDefaults.Spec.WorkflowMetadata.LabelsFrom))
 	}
 	if wf.Spec.WorkflowTemplateRef != nil && wfSpecHolder.GetWorkflowSpec().WorkflowMetadata != nil {
 		annotationSources = append(annotationSources, maps.Keys(wfSpecHolder.GetWorkflowSpec().WorkflowMetadata.Annotations))
@@ -330,7 +335,7 @@ func ValidateWorkflowTemplateRefFields(wfSpec wfv1.WorkflowSpec) error {
 }
 
 // ValidateWorkflowTemplate accepts a workflow template and performs validation against it.
-func ValidateWorkflowTemplate(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, wftmpl *wfv1.WorkflowTemplate, opts ValidateOpts) error {
+func ValidateWorkflowTemplate(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, wftmpl *wfv1.WorkflowTemplate, wfDefaults *wfv1.Workflow, opts ValidateOpts) error {
 	if len(wftmpl.Name) > maxCharsInObjectName {
 		return fmt.Errorf("workflow template name %q must not be more than 63 characters long (currently %d)", wftmpl.Name, len(wftmpl.Name))
 	}
@@ -344,11 +349,11 @@ func ValidateWorkflowTemplate(wftmplGetter templateresolution.WorkflowTemplateNa
 	}
 	opts.IgnoreEntrypoint = wf.Spec.Entrypoint == ""
 	opts.WorkflowTemplateValidation = true
-	return ValidateWorkflow(wftmplGetter, cwftmplGetter, wf, opts)
+	return ValidateWorkflow(wftmplGetter, cwftmplGetter, wf, wfDefaults, opts)
 }
 
 // ValidateClusterWorkflowTemplate accepts a cluster workflow template and performs validation against it.
-func ValidateClusterWorkflowTemplate(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, cwftmpl *wfv1.ClusterWorkflowTemplate, opts ValidateOpts) error {
+func ValidateClusterWorkflowTemplate(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, cwftmpl *wfv1.ClusterWorkflowTemplate, wfDefaults *wfv1.Workflow, opts ValidateOpts) error {
 	if len(cwftmpl.Name) > maxCharsInObjectName {
 		return fmt.Errorf("cluster workflow template name %q must not be more than 63 characters long (currently %d)", cwftmpl.Name, len(cwftmpl.Name))
 	}
@@ -362,11 +367,14 @@ func ValidateClusterWorkflowTemplate(wftmplGetter templateresolution.WorkflowTem
 	}
 	opts.IgnoreEntrypoint = wf.Spec.Entrypoint == ""
 	opts.WorkflowTemplateValidation = true
-	return ValidateWorkflow(wftmplGetter, cwftmplGetter, wf, opts)
+	return ValidateWorkflow(wftmplGetter, cwftmplGetter, wf, wfDefaults, opts)
 }
 
 // ValidateCronWorkflow validates a CronWorkflow
-func ValidateCronWorkflow(wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, cronWf *wfv1.CronWorkflow) error {
+func ValidateCronWorkflow(ctx context.Context, wftmplGetter templateresolution.WorkflowTemplateNamespacedGetter, cwftmplGetter templateresolution.ClusterWorkflowTemplateGetter, cronWf *wfv1.CronWorkflow, wfDefaults *wfv1.Workflow) error {
+	if len(cronWf.Spec.Schedules) > 0 && cronWf.Spec.Schedule != "" {
+		return fmt.Errorf("cron workflow cant be configured with both Spec.Schedule and Spec.Schedules")
+	}
 	// CronWorkflows have fewer max chars allowed in their name because when workflows are created from them, they
 	// are appended with the unix timestamp (`-1615836720`). This lower character allowance allows for that timestamp
 	// to still fit within the 63 character maximum.
@@ -374,8 +382,10 @@ func ValidateCronWorkflow(wftmplGetter templateresolution.WorkflowTemplateNamesp
 		return fmt.Errorf("cron workflow name %q must not be more than 52 characters long (currently %d)", cronWf.Name, len(cronWf.Name))
 	}
 
-	if _, err := cron.ParseStandard(cronWf.Spec.Schedule); err != nil {
-		return errors.Errorf(errors.CodeBadRequest, "cron schedule is malformed: %s", err)
+	for _, schedule := range cronWf.Spec.GetSchedules(ctx) {
+		if _, err := cron.ParseStandard(schedule); err != nil {
+			return errors.Errorf(errors.CodeBadRequest, "cron schedule %s is malformed: %s", schedule, err)
+		}
 	}
 
 	switch cronWf.Spec.ConcurrencyPolicy {
@@ -391,7 +401,7 @@ func ValidateCronWorkflow(wftmplGetter templateresolution.WorkflowTemplateNamesp
 
 	wf := common.ConvertCronWorkflowToWorkflow(cronWf)
 
-	err := ValidateWorkflow(wftmplGetter, cwftmplGetter, wf, ValidateOpts{})
+	err := ValidateWorkflow(wftmplGetter, cwftmplGetter, wf, wfDefaults, ValidateOpts{})
 	if err != nil {
 		return errors.Errorf(errors.CodeBadRequest, "cannot validate Workflow: %s", err)
 	}
@@ -469,13 +479,14 @@ func (ctx *templateValidationCtx) validateTemplate(tmpl *wfv1.Template, tmplCtx 
 
 	}
 
+	templateScope := tmplCtx.GetTemplateScope()
 	tmplID := getTemplateID(tmpl)
-	_, ok := ctx.results[tmplID]
+	_, ok := ctx.results[templateScope+tmplID]
 	if ok {
 		// we can skip the rest since it has been validated.
 		return nil
 	}
-	ctx.results[tmplID] = true
+	ctx.results[templateScope+tmplID] = true
 
 	for globalVar, val := range ctx.globalParams {
 		scope[globalVar] = val
@@ -505,7 +516,7 @@ func (ctx *templateValidationCtx) validateTemplate(tmpl *wfv1.Template, tmplCtx 
 	if newTmpl.Metrics != nil {
 		for _, metric := range newTmpl.Metrics.Prometheus {
 			if !metrics.IsValidMetricName(metric.Name) {
-				return errors.Errorf(errors.CodeBadRequest, "templates.%s metric name '%s' is invalid. Metric names must contain alphanumeric characters, '_', or ':'", tmpl.Name, metric.Name)
+				return errors.Errorf(errors.CodeBadRequest, "templates.%s metric name '%s' is invalid. Metric names must contain alphanumeric characters or '_'", tmpl.Name, metric.Name)
 			}
 			if err := metrics.ValidateMetricLabels(metric.GetMetricLabels()); err != nil {
 				return err
@@ -521,6 +532,17 @@ func (ctx *templateValidationCtx) validateTemplate(tmpl *wfv1.Template, tmplCtx 
 	return nil
 }
 
+// VerifyResolvedVariables is a helper to ensure all {{variables}} have been resolved for a object
+func VerifyResolvedVariables(obj interface{}) error {
+	str, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	return template.Validate(string(str), func(tag string) error {
+		return errors.Errorf(errors.CodeBadRequest, "failed to resolve {{%s}}", tag)
+	})
+}
+
 // validateTemplateHolder validates a template holder and returns the validated template.
 func (ctx *templateValidationCtx) validateTemplateHolder(tmplHolder wfv1.TemplateReferenceHolder, tmplCtx *templateresolution.Context, args wfv1.ArgumentsProvider, workflowTemplateValidation bool) (*wfv1.Template, error) {
 	tmplRef := tmplHolder.GetTemplateRef()
@@ -534,6 +556,10 @@ func (ctx *templateValidationCtx) validateTemplateHolder(tmplHolder wfv1.Templat
 		}
 		if tmplRef.Template == "" {
 			return nil, errors.New(errors.CodeBadRequest, "template name is required")
+		}
+		if err := VerifyResolvedVariables(tmplRef); err != nil {
+			logrus.Warnf("template reference need resolution: %v", err)
+			return nil, nil
 		}
 	} else if tmplName != "" {
 		_, err := tmplCtx.GetTemplateByName(tmplName)
@@ -856,11 +882,24 @@ func validateArgumentsFieldNames(prefix string, arguments wfv1.Arguments) error 
 // validateArgumentsValues ensures that all arguments have parameter values or artifact locations
 func validateArgumentsValues(prefix string, arguments wfv1.Arguments, allowEmptyValues bool) error {
 	for _, param := range arguments.Parameters {
+		// check if any value is defined
 		if param.ValueFrom == nil && param.Value == nil {
 			if !allowEmptyValues {
-				return errors.Errorf(errors.CodeBadRequest, "%s%s.value is required", prefix, param.Name)
+				return errors.Errorf(errors.CodeBadRequest, "%s%s.value or %s%s.valueFrom is required", prefix, param.Name, prefix, param.Name)
 			}
 		}
+		if param.ValueFrom != nil {
+			// check for valid valueFrom sub-parameters
+			// INFO: default needs to be accompanied by ConfigMapKeyRef.
+			if param.ValueFrom.ConfigMapKeyRef == nil && param.ValueFrom.Event == "" && param.ValueFrom.Supplied == nil {
+				return errors.Errorf(errors.CodeBadRequest, "%s%s.valueFrom only allows: default, configMapKeyRef and supplied", prefix, param.Name)
+			}
+			// check for invalid valueFrom sub-parameters
+			if param.ValueFrom.Path != "" || param.ValueFrom.JSONPath != "" || param.ValueFrom.Parameter != "" || param.ValueFrom.Expression != "" {
+				return errors.Errorf(errors.CodeBadRequest, "%s%s.valueFrom only allows: default, configMapKeyRef and supplied", prefix, param.Name)
+			}
+		}
+		// validate enum
 		if param.Enum != nil {
 			if len(param.Enum) == 0 {
 				return errors.Errorf(errors.CodeBadRequest, "%s%s.enum should contain at least one value", prefix, param.Name)
@@ -924,7 +963,12 @@ func (ctx *templateValidationCtx) validateSteps(scope map[string]interface{}, tm
 			if err != nil {
 				return err
 			}
-			resolvedTmpl, err := ctx.validateTemplateHolder(&step, tmplCtx, &FakeArguments{}, workflowTemplateValidation)
+			var args wfv1.ArgumentsProvider
+			args = &FakeArguments{}
+			if step.TemplateRef != nil {
+				args = &step.Arguments
+			}
+			resolvedTmpl, err := ctx.validateTemplateHolder(&step, tmplCtx, args, workflowTemplateValidation)
 			if err != nil {
 				return errors.Errorf(errors.CodeBadRequest, "templates.%s.steps[%d].%s %s", tmpl.Name, i, step.Name, err.Error())
 			}
@@ -1025,6 +1069,9 @@ func (ctx *templateValidationCtx) addOutputsToScope(tmpl *wfv1.Template, prefix 
 	scope[fmt.Sprintf("%s.startedAt", prefix)] = true
 	scope[fmt.Sprintf("%s.finishedAt", prefix)] = true
 	scope[fmt.Sprintf("%s.hostNodeName", prefix)] = true
+	if tmpl == nil {
+		return
+	}
 	if tmpl.Daemon != nil && *tmpl.Daemon {
 		scope[fmt.Sprintf("%s.ip", prefix)] = true
 	}
@@ -1314,7 +1361,13 @@ func (ctx *templateValidationCtx) validateDAG(scope map[string]interface{}, tmpl
 			return errors.Errorf(errors.CodeBadRequest, "templates.%s cannot use 'continueOn' when using 'depends'. Instead use 'dep-task.Failed'/'dep-task.Errored'", tmpl.Name)
 		}
 
-		resolvedTmpl, err := ctx.validateTemplateHolder(&task, tmplCtx, &FakeArguments{}, workflowTemplateValidation)
+		var args wfv1.ArgumentsProvider
+		args = &FakeArguments{}
+		if task.TemplateRef != nil {
+			args = &task.Arguments
+		}
+
+		resolvedTmpl, err := ctx.validateTemplateHolder(&task, tmplCtx, args, workflowTemplateValidation)
 
 		if err != nil {
 			return errors.Errorf(errors.CodeBadRequest, "templates.%s.tasks.%s %s", tmpl.Name, task.Name, err.Error())
@@ -1423,10 +1476,7 @@ func validateDAGTaskArgumentDependency(arguments wfv1.Arguments, ancestry []stri
 	}
 
 	for _, param := range arguments.Parameters {
-		if param.Value == nil {
-			return errors.Errorf(errors.CodeBadRequest, "missing value for parameter '%s'", param.Name)
-		}
-		if strings.HasPrefix(param.Value.String(), "{{tasks.") {
+		if param.Value != nil && strings.HasPrefix(param.Value.String(), "{{tasks.") {
 			// All parameter values should have been validated, so
 			// index 1 should exist.
 			refTaskName := strings.Split(param.Value.String(), ".")[1]

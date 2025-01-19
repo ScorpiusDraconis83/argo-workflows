@@ -1,14 +1,13 @@
 package fixtures
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/TwiN/go-color"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/yaml"
@@ -23,6 +22,7 @@ type Given struct {
 	client            v1alpha1.WorkflowInterface
 	wfebClient        v1alpha1.WorkflowEventBindingInterface
 	wfTemplateClient  v1alpha1.WorkflowTemplateInterface
+	wftsClient        v1alpha1.WorkflowTaskSetInterface
 	cwfTemplateClient v1alpha1.ClusterWorkflowTemplateInterface
 	cronClient        v1alpha1.CronWorkflowInterface
 	hydrator          hydrator.Interface
@@ -43,7 +43,16 @@ func (g *Given) Workflow(text string) *Given {
 	g.t.Helper()
 	g.wf = &wfv1.Workflow{}
 	g.readResource(text, g.wf)
-	g.checkImages(g.wf)
+	g.checkImages(g.wf, false)
+	return g
+}
+
+// Load parsed Workflow that's assumed to be from the "examples/" directory
+func (g *Given) ExampleWorkflow(wf *wfv1.Workflow) *Given {
+	g.t.Helper()
+	g.wf = wf
+	g.checkLabels(wf)
+	g.checkImages(g.wf, true)
 	return g
 }
 
@@ -81,38 +90,40 @@ func (g *Given) readResource(text string, v metav1.Object) {
 	}
 }
 
-func (g *Given) checkImages(wf interface{}) {
+// Check if given Workflow, WorkflowTemplate, or CronWorkflow uses forbidden images.
+// Using an arbitrary image will result in slow and flakey tests as we can't really predict when they'll be
+// downloaded or evicted. To keep tests fast and reliable you must use allowed images.
+// Workflows from the examples/ folder are given special treatment and allowed to use a wider range of images.
+func (g *Given) checkImages(wf interface{}, isExample bool) {
 	g.t.Helper()
 	var defaultImage string
 	var templates []wfv1.Template
 	switch baseTemplate := wf.(type) {
 	case *wfv1.Workflow:
+		templates = baseTemplate.Spec.Templates
 		if baseTemplate.Spec.TemplateDefaults != nil && baseTemplate.Spec.TemplateDefaults.Container != nil && baseTemplate.Spec.TemplateDefaults.Container.Image != "" {
 			defaultImage = baseTemplate.Spec.TemplateDefaults.Container.Image
-			templates = baseTemplate.Spec.Templates
 		}
 	case *wfv1.WorkflowTemplate:
+		templates = baseTemplate.Spec.Templates
 		if baseTemplate.Spec.TemplateDefaults != nil && baseTemplate.Spec.TemplateDefaults.Container != nil && baseTemplate.Spec.TemplateDefaults.Container.Image != "" {
 			defaultImage = baseTemplate.Spec.TemplateDefaults.Container.Image
-			templates = baseTemplate.Spec.Templates
 		}
 	case *wfv1.CronWorkflow:
+		templates = baseTemplate.Spec.WorkflowSpec.Templates
 		if baseTemplate.Spec.WorkflowSpec.TemplateDefaults != nil && baseTemplate.Spec.WorkflowSpec.TemplateDefaults.Container != nil && baseTemplate.Spec.WorkflowSpec.TemplateDefaults.Container.Image != "" {
 			defaultImage = baseTemplate.Spec.WorkflowSpec.TemplateDefaults.Container.Image
-			templates = baseTemplate.Spec.WorkflowSpec.Templates
 		}
 	default:
 		g.t.Fatalf("Unsupported checkImage workflow type: %s", wf)
 	}
 
-	// discouraged
-	discouraged := func(image string) bool {
-		return image == "python:alpine3.6"
-	}
-	// Using an arbitrary image will result in slow and flakey tests as we can't really predict when they'll be
-	// downloaded or evicted. To keep tests fast and reliable you must use allowed images.
 	allowed := func(image string) bool {
-		return strings.Contains(image, "argoexec:") || image == "argoproj/argosay:v1" || image == "argoproj/argosay:v2" || discouraged(image)
+		return strings.Contains(image, "argoexec:") ||
+			image == "argoproj/argosay:v1" ||
+			image == "argoproj/argosay:v2" ||
+			image == "quay.io/argoproj/argocli:latest" ||
+			(isExample && (image == "busybox" || image == "python:alpine3.6"))
 	}
 	for _, t := range templates {
 		container := t.Container
@@ -129,9 +140,6 @@ func (g *Given) checkImages(wf interface{}) {
 			// (⎈ |docker-desktop:argo)➜  ~ time docker run --rm argoproj/argosay:v2
 			// docker run --rm argoproj/argosay˜:v2  0.21s user 0.10s system 16% cpu 1.912 total
 			// docker run --rm argoproj/argosay:v1  0.17s user 0.08s system 31% cpu 0.784 total
-			if discouraged(image) {
-				_, _ = fmt.Println(color.Ize(color.Yellow, "DISCOURAGED IMAGE: "+g.t.Name()+" is using "+image))
-			}
 		}
 	}
 }
@@ -166,7 +174,7 @@ func (g *Given) WorkflowTemplate(text string) *Given {
 	g.t.Helper()
 	wfTemplate := &wfv1.WorkflowTemplate{}
 	g.readResource(text, wfTemplate)
-	g.checkImages(wfTemplate)
+	g.checkImages(wfTemplate, false)
 	g.wfTemplates = append(g.wfTemplates, wfTemplate)
 	return g
 }
@@ -175,21 +183,28 @@ func (g *Given) CronWorkflow(text string) *Given {
 	g.t.Helper()
 	g.cronWf = &wfv1.CronWorkflow{}
 	g.readResource(text, g.cronWf)
-	g.checkImages(g.cronWf)
+	g.checkImages(g.cronWf, false)
 	return g
 }
 
 var NoError = func(t *testing.T, output string, err error) {
 	t.Helper()
-	assert.NoError(t, err, output)
+	require.NoError(t, err, output)
+}
+
+var ErrorOutput = func(contains string) func(t *testing.T, output string, err error) {
+	return func(t *testing.T, output string, err error) {
+		t.Helper()
+		require.Error(t, err)
+		assert.Contains(t, output, contains)
+	}
 }
 
 var OutputRegexp = func(rx string) func(t *testing.T, output string, err error) {
 	return func(t *testing.T, output string, err error) {
 		t.Helper()
-		if assert.NoError(t, err, output) {
-			assert.Regexp(t, rx, output)
-		}
+		require.NoError(t, err, output)
+		assert.Regexp(t, rx, output)
 	}
 }
 
@@ -198,6 +213,12 @@ func (g *Given) Exec(name string, args []string, block func(t *testing.T, output
 	output, err := Exec(name, args...)
 	block(g.t, output, err)
 	return g
+}
+
+// Use Kubectl to server-side apply the given file
+func (g *Given) KubectlApply(file string, block func(t *testing.T, output string, err error)) *Given {
+	g.t.Helper()
+	return g.Exec("kubectl", append([]string{"-n", Namespace, "apply", "--server-side", "-f"}, file), block)
 }
 
 func (g *Given) RunCli(args []string, block func(t *testing.T, output string, err error)) *Given {
@@ -223,6 +244,7 @@ func (g *Given) When() *When {
 		client:            g.client,
 		wfebClient:        g.wfebClient,
 		wfTemplateClient:  g.wfTemplateClient,
+		wftsClient:        g.wftsClient,
 		cwfTemplateClient: g.cwfTemplateClient,
 		cronClient:        g.cronClient,
 		hydrator:          g.hydrator,

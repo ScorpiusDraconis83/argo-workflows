@@ -14,13 +14,26 @@ To install Argo Workflows, navigate to the [releases page](https://github.com/ar
 
 You can use Kustomize to patch your preferred [configurations](managed-namespace.md) on top of the base manifest.
 
-⚠️ If you are using GitOps, never use Kustomize remote base: this is dangerous. Instead, copy the manifests into your Git repo.
+!!! Note "Use a full hash"
+    If you are using a [remote base](https://github.com/kubernetes-sigs/kustomize/blob/ab519fdc13ded9875e42d70ac8a5b1b9023a2dbb/examples/remoteBuild.md) with Kustomize, you should specify a full commit hash, for example `?ref=960af331a8c0a3f2e263c8b90f1daf4303816ba8`.
 
-⚠️ `latest` is tip, not stable. Never run it in production.
+!!! Warning "`latest` vs stable"
+    `latest` is the tip of the `main` branch and may not be stable.
+    In production, you should use a specific release version.
 
 #### Argo Workflows Helm Chart
 
 You can install Argo Workflows using the community maintained [Helm charts](https://github.com/argoproj/argo-helm).
+
+### Full CRDs
+
+The official release manifests come with stripped-down CRDs that omit validation information.
+This is a workaround for [Kubernetes size limitations](https://github.com/kubernetes/kubernetes/issues/82292) when using client-side apply.
+As of version 3.7, the full CRDs can be installed using [server-side apply](https://kubernetes.io/docs/reference/using-api/server-side-apply/) via the following command:
+
+```bash
+kubectl apply --server-side --kustomize https://github.com/argoproj/argo-workflows/manifests/base/crds/full?ref=v3.7.0
+```
 
 ## Installation options
 
@@ -34,6 +47,7 @@ Determine your base installation option.
 
 Review the following:
 
+* [Workflow RBAC](workflow-rbac.md)
 * [Security](security.md).
 * [Scaling](scaling.md) and [running at massive scale](running-at-massive-scale.md).
 * [High-availability](high-availability.md)
